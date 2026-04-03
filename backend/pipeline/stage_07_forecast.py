@@ -176,44 +176,62 @@ def run(
     return ForecastOutput(forecasts=forecasts)
 
 
-def _run_timesfm(ctx: np.ndarray, horizon: int, emit: Callable):
-    """TimesFM 2.5 inference with statistical fallback."""
-    try:
-        import timesfm
-        import torch
-        emit("Loading TimesFM 2.5 model weights (first run downloads ~800MB)", 0.2)
-
-        model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
-            "google/timesfm-2.5-200m-pytorch"
-        )
-        model.compile(
-            timesfm.ForecastConfig(
-                max_context=min(1024, len(ctx)),
-                max_horizon=horizon,
-                normalize_inputs=True,
-                use_continuous_quantile_head=True,
-                force_flip_invariance=True,
-                infer_is_positive=False,     # returns can go negative
-                fix_quantile_crossing=True,
+def _call_modal(ctx: np.ndarray, horizon: int, model: str, emit: Callable, num_samples: int = 50):
+    """
+    Call the Modal inference endpoint (prod) or fall back to local models (dev).
+    MODAL_ENDPOINT_URL env var controls which path is taken.
+    """
+    import os, requests as _requests
+    endpoint = os.environ.get("MODAL_ENDPOINT_URL", "")
+    if endpoint:
+        try:
+            emit(f"Calling Modal inference ({model})...", 0.3)
+            resp = _requests.post(
+                endpoint,
+                json={"context": ctx.tolist(), "horizon": horizon,
+                      "model": model, "num_samples": num_samples},
+                timeout=120,
             )
-        )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.warning(f"Modal call failed ({e}), falling back to local")
+    return None
 
-        emit("Running TimesFM 2.5 inference", 0.5)
-        point_forecast, quantile_forecast = model.forecast(
-            horizon=horizon,
-            inputs=[ctx],
-        )
-        emit("TimesFM 2.5 inference complete", 0.65)
 
-        # point_forecast shape: (1, horizon), quantile_forecast: (1, horizon, n_quantiles)
-        pf = np.array(point_forecast[0][:horizon])
-        qf = np.array(quantile_forecast[0][:horizon])  # (horizon, n_quantiles)
+def _run_timesfm(ctx: np.ndarray, horizon: int, emit: Callable):
+    """TimesFM 2.5 inference — Modal endpoint in prod, local model in dev."""
+    # Try Modal first
+    modal_result = _call_modal(ctx, horizon, "timesfm", emit)
+    if modal_result and modal_result.get("timesfm_point"):
+        pf = np.array(modal_result["timesfm_point"])
+        qf = np.array(modal_result["timesfm_quantiles"])
         if qf.ndim == 1:
             qf = qf[:, np.newaxis]
         return pf, qf
 
+    # Local fallback (dev / Modal unavailable)
+    try:
+        import timesfm, torch
+        emit("Loading TimesFM 2.5 locally (dev mode)...", 0.2)
+        model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
+            "google/timesfm-2.5-200m-pytorch"
+        )
+        model.compile(timesfm.ForecastConfig(
+            max_context=min(1024, len(ctx)), max_horizon=horizon,
+            normalize_inputs=True, use_continuous_quantile_head=True,
+            force_flip_invariance=True, infer_is_positive=False,
+            fix_quantile_crossing=True,
+        ))
+        emit("Running TimesFM locally", 0.5)
+        pf_arr, qf_arr = model.forecast(horizon=horizon, inputs=[ctx])
+        pf = np.array(pf_arr[0][:horizon])
+        qf = np.array(qf_arr[0][:horizon])
+        if qf.ndim == 1:
+            qf = qf[:, np.newaxis]
+        return pf, qf
     except Exception as e:
-        logger.warning(f"TimesFM unavailable ({e}), using statistical fallback")
+        logger.warning(f"TimesFM local also failed ({e}), using statistical fallback")
         return _statistical_forecast(ctx, horizon)
 
 
@@ -249,47 +267,34 @@ def _statistical_forecast(ctx: np.ndarray, horizon: int):
 
 
 def _run_chronos(ctx: np.ndarray, horizon: int, emit: Callable):
-    """
-    Chronos probabilistic forecaster (Amazon, 2024).
-    Uses chronos-t5-small for speed; upgrade to chronos-t5-large for accuracy.
-    Returns (point_forecast, quantile_forecast) matching TimesFM format.
-    """
+    """Chronos inference — Modal endpoint in prod, local model in dev."""
+    # Try Modal first
+    modal_result = _call_modal(ctx, horizon, "chronos", emit)
+    if modal_result and modal_result.get("chronos_point"):
+        ch_point = np.array(modal_result["chronos_point"])
+        ch_quant = np.array(modal_result["chronos_quantiles"])
+        return ch_point, ch_quant
+
+    # Local fallback
     try:
         import torch
         from chronos import BaseChronosPipeline
-
-        emit("Chronos: loading model weights (first run downloads ~250MB)", 0.57)
+        emit("Chronos: loading locally (dev mode)...", 0.57)
         device = "mps" if torch.backends.mps.is_available() else "cpu"
         pipeline = BaseChronosPipeline.from_pretrained(
-            "amazon/chronos-t5-small",
-            device_map=device,
-            dtype="float32",
+            "amazon/chronos-t5-small", device_map=device, dtype="float32",
         )
-
         emit("Chronos: running inference", 0.62)
-        context_tensor = torch.tensor(ctx, dtype=torch.float32).unsqueeze(0)
-
-        forecast_tensor = pipeline.predict(
-            inputs=context_tensor,
-            prediction_length=horizon,
-            num_samples=50,
-            limit_prediction_length=False,
-        )
-        # forecast_tensor shape: (batch=1, num_samples, horizon)
-        samples = forecast_tensor[0].numpy()  # (num_samples, horizon)
-
-        point_forecast = samples.mean(axis=0)  # (horizon,)
-
-        # Build quantile matrix (horizon × 10 quantiles) matching TimesFM format
+        ctx_t = torch.tensor(ctx, dtype=torch.float32).unsqueeze(0)
+        samples = pipeline.predict(
+            inputs=ctx_t, prediction_length=horizon,
+            num_samples=50, limit_prediction_length=False,
+        )[0].numpy()
+        ch_point = samples.mean(axis=0)
         q_levels = np.linspace(0.1, 0.9, 10)
-        quantile_forecast = np.array([
-            np.quantile(samples[:, h], q_levels) for h in range(horizon)
-        ])  # (horizon, 10)
-
+        ch_quant = np.array([np.quantile(samples[:, h], q_levels) for h in range(horizon)])
         emit("Chronos: inference complete", 0.70)
-        logger.info(f"[Stage 07] Chronos point: {point_forecast[:3]}")
-        return point_forecast, quantile_forecast
-
+        return ch_point, ch_quant
     except Exception as e:
         logger.warning(f"[Stage 07] Chronos unavailable ({e}), skipping")
         return None, None

@@ -136,44 +136,46 @@ def run(
         else:
             regime_map = {int(l): f"regime_{l}" for l in unique_lbls}
 
-    # ── 3. Load TimesFM once, reuse across all backtest steps ─────────────────
-    timesfm_model = None
-    try:
-        import timesfm
-        emit("Loading TimesFM 2.5 for backtest (loads once, reused each step)...", 0.06)
-        timesfm_model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
-            "google/timesfm-2.5-200m-pytorch"
-        )
-        timesfm_model.compile(timesfm.ForecastConfig(
-            max_context=min(512, min_train),
-            max_horizon=horizon,
-            normalize_inputs=True,
-            use_continuous_quantile_head=True,
-            force_flip_invariance=True,
-            infer_is_positive=False,
-            fix_quantile_crossing=True,
-        ))
-        emit("TimesFM loaded ✓", 0.08)
-    except Exception as e:
-        logger.warning(f"TimesFM not available for backtest ({e}), using statistical fallback")
-        timesfm_model = None
+    # ── 3. Prepare inference backend ───────────────────────────────────────────
+    import os
+    modal_endpoint = os.environ.get("MODAL_ENDPOINT_URL", "")
 
-    # ── Load Chronos once ──────────────────────────────────────────────────────
-    chronos_pipeline = None
-    try:
-        import torch
-        from chronos import BaseChronosPipeline
-        emit("Loading Chronos for backtest (loads once, reused each step)...", 0.08)
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
-        chronos_pipeline = BaseChronosPipeline.from_pretrained(
-            "amazon/chronos-t5-small",
-            device_map=device,
-            dtype="float32",
-        )
-        emit("Chronos loaded ✓", 0.09)
-    except Exception as e:
-        logger.warning(f"Chronos not available for backtest ({e}), will use TimesFM only")
+    if modal_endpoint:
+        # Production: Modal handles both models — no local loading needed
+        emit(f"Using Modal inference endpoint (prod)", 0.06)
+        timesfm_model    = "modal"
+        chronos_pipeline = "modal"
+    else:
+        # Development: load models locally
+        timesfm_model = None
+        try:
+            import timesfm
+            emit("Loading TimesFM 2.5 locally (dev)...", 0.06)
+            timesfm_model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
+                "google/timesfm-2.5-200m-pytorch"
+            )
+            timesfm_model.compile(timesfm.ForecastConfig(
+                max_context=min(512, min_train), max_horizon=horizon,
+                normalize_inputs=True, use_continuous_quantile_head=True,
+                force_flip_invariance=True, infer_is_positive=False,
+                fix_quantile_crossing=True,
+            ))
+            emit("TimesFM loaded ✓", 0.08)
+        except Exception as e:
+            logger.warning(f"TimesFM not available ({e}), using statistical fallback")
+
         chronos_pipeline = None
+        try:
+            import torch
+            from chronos import BaseChronosPipeline
+            emit("Loading Chronos locally (dev)...", 0.08)
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            chronos_pipeline = BaseChronosPipeline.from_pretrained(
+                "amazon/chronos-t5-small", device_map=device, dtype="float32",
+            )
+            emit("Chronos loaded ✓", 0.09)
+        except Exception as e:
+            logger.warning(f"Chronos not available ({e}), TimesFM only")
 
     # ── 4. Walk-forward loop ───────────────────────────────────────────────────
     equity = initial_capital
@@ -249,31 +251,54 @@ def run(
                 tf_point, tf_quant = None, None
                 ch_point, ch_quant = None, None
 
-                # TimesFM — always run when available
-                if timesfm_model is not None:
-                    point_arr, quant_arr = timesfm_model.forecast(
-                        horizon=horizon, inputs=[ctx]
-                    )
-                    tf_point = np.array(point_arr[0][:horizon])
-                    tf_quant = np.array(quant_arr[0][:horizon])
-                    if tf_quant.ndim == 1:
-                        tf_quant = tf_quant[:, np.newaxis]
+                need_chronos = (hmm_regime_name == "mean_reverting")
 
-                # Chronos — mean_reverting only; skip in trending (degrades WR)
-                if chronos_pipeline is not None and hmm_regime_name == "mean_reverting":
-                    import torch
-                    ctx_tensor = torch.tensor(ctx, dtype=torch.float32).unsqueeze(0)
-                    ch_samples = chronos_pipeline.predict(
-                        inputs=ctx_tensor,
-                        prediction_length=horizon,
-                        num_samples=20,   # fewer samples for speed in loop
-                        limit_prediction_length=False,
-                    )[0].numpy()          # (20, horizon)
-                    ch_point = ch_samples.mean(axis=0)
-                    q_levels = np.linspace(0.1, 0.9, 10)
-                    ch_quant = np.array([
-                        np.quantile(ch_samples[:, h], q_levels) for h in range(horizon)
-                    ])
+                if modal_endpoint:
+                    # ── Production: single Modal call per step ────────────────
+                    import requests as _req
+                    _model_req = "both" if need_chronos else "timesfm"
+                    try:
+                        _resp = _req.post(
+                            modal_endpoint,
+                            json={"context": ctx.tolist(), "horizon": horizon,
+                                  "model": _model_req, "num_samples": 20},
+                            timeout=120,
+                        )
+                        _resp.raise_for_status()
+                        _res = _resp.json()
+                        if _res.get("timesfm_point"):
+                            tf_point = np.array(_res["timesfm_point"])
+                            tf_quant = np.array(_res["timesfm_quantiles"])
+                            if tf_quant.ndim == 1:
+                                tf_quant = tf_quant[:, np.newaxis]
+                        if need_chronos and _res.get("chronos_point"):
+                            ch_point = np.array(_res["chronos_point"])
+                            ch_quant = np.array(_res["chronos_quantiles"])
+                    except Exception as _e:
+                        logger.debug(f"Modal call failed at t={t}: {_e}")
+                else:
+                    # ── Development: local models ─────────────────────────────
+                    if timesfm_model is not None and timesfm_model != "modal":
+                        point_arr, quant_arr = timesfm_model.forecast(
+                            horizon=horizon, inputs=[ctx]
+                        )
+                        tf_point = np.array(point_arr[0][:horizon])
+                        tf_quant = np.array(quant_arr[0][:horizon])
+                        if tf_quant.ndim == 1:
+                            tf_quant = tf_quant[:, np.newaxis]
+
+                    if need_chronos and chronos_pipeline is not None and chronos_pipeline != "modal":
+                        import torch
+                        ctx_tensor = torch.tensor(ctx, dtype=torch.float32).unsqueeze(0)
+                        ch_samples = chronos_pipeline.predict(
+                            inputs=ctx_tensor, prediction_length=horizon,
+                            num_samples=20, limit_prediction_length=False,
+                        )[0].numpy()
+                        ch_point = ch_samples.mean(axis=0)
+                        q_levels = np.linspace(0.1, 0.9, 10)
+                        ch_quant = np.array([
+                            np.quantile(ch_samples[:, h], q_levels) for h in range(horizon)
+                        ])
 
                 # ── Ensemble by regime ────────────────────────────────────────
                 if hmm_regime_name == "trending":
