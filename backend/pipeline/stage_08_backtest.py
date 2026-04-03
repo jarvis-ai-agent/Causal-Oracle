@@ -20,9 +20,15 @@ class BacktestOutput:
 
 
 def _kelly_fraction(win_rate: float, avg_win: float, avg_loss: float) -> float:
-    if avg_loss == 0:
-        return 0.0
-    k = win_rate / abs(avg_loss) - (1 - win_rate) / abs(avg_win) if avg_win != 0 else 0.0
+    """
+    Correct Kelly criterion: f* = (W * b - (1-W)) / b
+    where b = avg_win / avg_loss (the win/loss ratio).
+    Capped at 20% max position size for risk management.
+    """
+    if avg_win <= 0 or avg_loss <= 0:
+        return 0.02  # safe floor
+    b = avg_win / avg_loss  # win/loss ratio
+    k = (win_rate * b - (1 - win_rate)) / b
     return max(0.0, min(k, 0.20))
 
 
@@ -31,6 +37,7 @@ def run(
     validated_parents: Dict[str, List[Dict]],
     regime_labels: np.ndarray,
     target_col: str,
+    raw_returns_df: Optional[pd.DataFrame] = None,
     initial_capital: float = 100000.0,
     horizon: int = 5,
     causal_retrain_interval: int = 60,
@@ -44,11 +51,17 @@ def run(
 
     emit("Starting walk-forward backtest", 0.0)
 
-    if target_col not in features_df.columns:
-        candidates = [c for c in features_df.columns if "_ret" in c]
-        target_col = candidates[0] if candidates else features_df.columns[0]
+    # Use raw (un-normalized) returns for P&L calculation
+    # Fall back to features_df only if raw_returns_df not provided
+    returns_source = raw_returns_df if raw_returns_df is not None else features_df
 
-    target_series = features_df[target_col].dropna()
+    if target_col not in returns_source.columns:
+        candidates = [c for c in returns_source.columns if "_ret" in c]
+        target_col = candidates[0] if candidates else returns_source.columns[0]
+        logger.warning(f"Target col not in returns_source, using {target_col}")
+
+    target_series = returns_source[target_col].dropna()
+    logger.info(f"[Stage 08] Return series stats: mean={target_series.mean():.6f}, std={target_series.std():.6f}, min={target_series.min():.4f}, max={target_series.max():.4f}")
     n = len(target_series)
 
     # We need at least 200 rows for meaningful backtest
@@ -110,15 +123,18 @@ def run(
         q10_1 = cached_q10[0] if len(cached_q10) > 0 else -0.01
         q90_1 = cached_q90[0] if len(cached_q90) > 0 else 0.01
 
+        # Uncertainty: normalise by rolling std of returns so threshold is scale-invariant
+        rolling_std = float(np.std(train_data.values[-20:])) if len(train_data) >= 20 else 0.01
         uncertainty = float(np.mean(cached_q90 - cached_q10))
+        uncertainty_ratio = uncertainty / max(rolling_std, 1e-8)
 
-        # Signal logic
+        # Signal logic — require directional conviction, not strict ensemble agreement
         signal = "FLAT"
-        if point_1 > 0 and cached_agreement and q10_1 > -0.02:
+        if point_1 > rolling_std * 0.3:          # predicted move > 30% of typical daily move
             signal = "LONG"
-        elif point_1 < 0 and cached_agreement and q90_1 < 0.02:
+        elif point_1 < -rolling_std * 0.3:
             signal = "SHORT"
-        if uncertainty > 0.05:
+        if uncertainty_ratio > 4.0:               # bands too wide relative to typical vol
             signal = "FLAT"
 
         # Determine regime at this point
@@ -126,30 +142,46 @@ def run(
         regime_name = f"regime_{regime_idx}"
 
         if signal != "FLAT":
-            # Compute position size using simple Kelly fraction
-            win_rate = max(0.3, min(0.7, (sum(1 for w in wins if w > 0) + 1) / (len(wins) + 2)))
-            avg_win = np.mean([w for w in wins if w > 0]) if any(w > 0 for w in wins) else 0.01
-            avg_loss = abs(np.mean([l for l in losses if l < 0])) if any(l < 0 for l in losses) else 0.01
+            # Kelly sizing — Laplace-smoothed historical win rate, avg win/loss as pct of equity
+            n_wins  = sum(1 for w in wins if w > 0)
+            n_losses = sum(1 for l in losses if l < 0)
+            total_hist = n_wins + n_losses
+            win_rate = (n_wins + 1) / (total_hist + 2)  # Laplace smoothed
+
+            pct_wins   = [w / equity for w in wins  if w > 0] if wins   else [0.01]
+            pct_losses = [abs(l) / equity for l in losses if l < 0] if losses else [0.01]
+            avg_win  = float(np.mean(pct_wins))
+            avg_loss = float(np.mean(pct_losses))
+
             kelly = _kelly_fraction(win_rate, avg_win, avg_loss)
+            kelly = max(kelly, 0.02)  # floor: always risk at least 2% so early trades aren't zero
+            # Guard: if equity went negative (catastrophic loss), stop trading
+            if equity <= 0:
+                logger.warning(f"[Stage 08] Equity went to {equity:.2f} at t={t}, stopping")
+                break
             position_size = kelly * equity
 
-            # Entry and exit
-            entry_ret = float(target_series.iloc[t])
+            # Cumulative return over the holding period using log returns
             exit_t = min(t + horizon, n - 1)
-            exit_ret = float(target_series.iloc[exit_t])
+            hold_rets = target_series.iloc[t:exit_t].values
+            cum_ret = float(np.expm1(np.sum(hold_rets)))  # exp(sum(log_rets)) - 1
 
-            # P&L
             direction = 1 if signal == "LONG" else -1
-            pnl = direction * exit_ret * position_size
+            pnl = direction * cum_ret * position_size
             equity += pnl
+
+            entry_ret = float(target_series.iloc[t])
+            exit_ret  = float(target_series.iloc[exit_t])
 
             trade = {
                 "date": target_series.index[t].isoformat() if hasattr(target_series.index[t], "isoformat") else str(target_series.index[t]),
                 "asset": target_col,
                 "side": signal,
                 "size": round(position_size, 2),
+                "kelly": round(kelly, 4),
                 "entry": round(entry_ret, 6),
                 "exit": round(exit_ret, 6),
+                "cum_ret": round(cum_ret, 6),
                 "pnl": round(pnl, 2),
                 "regime": regime_name,
                 "horizon": horizon,

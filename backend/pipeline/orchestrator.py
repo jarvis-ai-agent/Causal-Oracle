@@ -346,6 +346,7 @@ class PipelineOrchestrator:
         result = await self._run_stage(
             8, stage_08_backtest.run,
             features_df=features.features_df,
+            raw_returns_df=features.raw_returns_df,
             validated_parents=validation.validated_parents,
             regime_labels=regime.regime_labels,
             target_col=self.config.target,

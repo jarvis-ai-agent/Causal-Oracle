@@ -11,7 +11,8 @@ logger = get_logger(__name__)
 
 @dataclass
 class FeatureOutput:
-    features_df: pd.DataFrame
+    features_df: pd.DataFrame       # normalized feature matrix (for causal/ML)
+    raw_returns_df: pd.DataFrame    # un-normalized log returns (for backtest P&L)
     feature_names: List[str]
     stationarity_report: Dict[str, Dict]
     warmup_rows_dropped: int
@@ -176,10 +177,16 @@ def run(
 
     features_df = features_df.dropna(how="all")
 
-    # ---- Normalization ----
+    # Save raw (un-normalized) returns BEFORE normalization — backtest needs real return values
+    raw_ret_cols = [c for c in features_df.columns if c.endswith("_ret")]
+    raw_returns_df = features_df[raw_ret_cols].copy()
+
+    # ---- Normalization — only non-return columns ----
+    # Returns are NOT normalized: their scale carries real financial meaning (P&L)
     if normalize:
-        emit("Normalizing features", 0.92)
-        for col in features_df.columns:
+        emit("Normalizing features (non-return columns only)", 0.92)
+        non_ret_cols = [c for c in features_df.columns if not c.endswith("_ret")]
+        for col in non_ret_cols:
             mu = features_df[col].mean()
             sigma = features_df[col].std()
             if sigma > 1e-8:
@@ -190,6 +197,7 @@ def run(
 
     return FeatureOutput(
         features_df=features_df,
+        raw_returns_df=raw_returns_df,
         feature_names=list(features_df.columns),
         stationarity_report=stationarity_report,
         warmup_rows_dropped=warmup,
