@@ -134,10 +134,10 @@ export default function RunsPage() {
                   <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                     <button
                       onClick={(e) => handleExport(e, run.id)}
-                      disabled={exporting === run.id || !run.results_available}
-                      title={run.results_available ? 'Export full JSON' : 'Run not complete'}
+                      disabled={exporting === run.id || run.status !== 'completed'}
+                      title={run.status === 'completed' ? 'Export full JSON' : 'Run not complete'}
                       className={`px-2.5 py-1 rounded text-xs border transition-colors ${
-                        run.results_available
+                        run.status === 'completed'
                           ? 'border-terminal-accent text-terminal-accent hover:bg-terminal-accent/10'
                           : 'border-terminal-border text-terminal-muted cursor-not-allowed opacity-40'
                       }`}

@@ -292,7 +292,7 @@ export default function PipelineControl() {
                   <div className="flex items-center justify-between mt-1">
                     <span className="text-xs text-terminal-muted">{fmtDateTime(run.created_at)}</span>
                     <div className="flex gap-1.5">
-                      {run.results_available && (
+                      {run.status === 'completed' && (
                         <button
                           onClick={e => handleExport(e, run.id)}
                           disabled={exporting === run.id}
