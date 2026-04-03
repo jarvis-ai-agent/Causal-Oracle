@@ -2,15 +2,25 @@
 # Start Causal Oracle — backend + frontend
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+VENV="$ROOT/backend/.venv"
+PYTHON="$VENV/bin/python"
+UVICORN="$VENV/bin/uvicorn"
 
 echo "Starting Causal Oracle..."
 echo "Root: $ROOT"
+echo "Python: $($PYTHON --version)"
 
-# Start backend
+# Validate venv exists
+if [ ! -f "$PYTHON" ]; then
+  echo "ERROR: venv not found at $VENV"
+  echo "Run: /opt/homebrew/bin/python3.12 -m venv backend/.venv && source backend/.venv/bin/activate && pip install -r requirements.txt"
+  exit 1
+fi
+
+# Start backend using explicit venv python
 cd "$ROOT/backend"
-source .venv/bin/activate
 echo "[Backend] Starting FastAPI on http://localhost:8000 ..."
-python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload &
+"$UVICORN" main:app --host 0.0.0.0 --port 8000 --reload &
 BACKEND_PID=$!
 
 # Start frontend

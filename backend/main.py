@@ -1,4 +1,34 @@
 """Causal Oracle — FastAPI application entry point."""
+import sys
+import importlib
+
+# --- Startup dependency check ---
+REQUIRED_MODULES = [
+    ("yfinance", "yfinance"),
+    ("pandas", "pandas"),
+    ("numpy", "numpy"),
+    ("fastapi", "fastapi"),
+    ("uvicorn", "uvicorn"),
+    ("statsmodels", "statsmodels"),
+    ("sklearn", "scikit-learn"),
+    ("hmmlearn", "hmmlearn"),
+    ("ta", "ta"),
+    ("dowhy", "dowhy"),
+    ("aiosqlite", "aiosqlite"),
+]
+
+missing = []
+for mod, pkg in REQUIRED_MODULES:
+    try:
+        importlib.import_module(mod)
+    except ImportError:
+        missing.append(pkg)
+
+if missing:
+    print(f"\n❌ MISSING PACKAGES: {', '.join(missing)}")
+    print(f"   Run: pip install {' '.join(missing)}\n")
+    sys.exit(1)
+
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager

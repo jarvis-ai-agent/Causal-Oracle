@@ -184,6 +184,21 @@ export default function PipelineStatus() {
         })}
       </div>
 
+      {/* Error banner — show full error when pipeline fails */}
+      {run?.status === 'failed' && (() => {
+        const errorLog = run?.logs?.find(l => l.level === 'ERROR')
+        return errorLog ? (
+          <div className="panel border-terminal-red/60">
+            <div className="panel-header text-terminal-red flex items-center gap-2">
+              <span>✗</span> Pipeline Error
+            </div>
+            <pre className="p-4 text-xs text-terminal-red font-mono leading-relaxed overflow-auto max-h-48 whitespace-pre-wrap">
+              {errorLog.message}
+            </pre>
+          </div>
+        ) : null
+      })()}
+
       {/* Log stream */}
       <div className="panel flex-1 flex flex-col min-h-0">
         <div className="panel-header">Live Log Stream</div>
@@ -198,10 +213,20 @@ export default function PipelineStatus() {
               <span className={`flex-none w-4 text-center ${
                 evt.stage ? 'text-terminal-accent' : 'text-terminal-muted'
               }`}>{evt.stage || '—'}</span>
-              <span className="text-terminal-text">{evt.message}</span>
+              <span className="text-terminal-text whitespace-pre-wrap">{evt.message}</span>
             </div>
           ))}
-          {wsEvents.length === 0 && (
+          {/* Fallback: show logs from DB if no WS events captured */}
+          {wsEvents.filter(e => e.event !== 'ping' && e.event !== 'connected').length === 0 && run?.logs?.length > 0 && (
+            run.logs.map((log, i) => (
+              <div key={i} className={`flex gap-2 mb-0.5 ${log.level === 'ERROR' ? 'text-terminal-red' : 'text-terminal-muted'}`}>
+                <span className="text-terminal-border flex-none">{log.timestamp?.slice(11, 19) || ''}</span>
+                <span className="flex-none w-4 text-center text-terminal-muted">{log.stage || '—'}</span>
+                <span className="text-terminal-text whitespace-pre-wrap">{log.message}</span>
+              </div>
+            ))
+          )}
+          {wsEvents.length === 0 && (!run?.logs || run.logs.length === 0) && (
             <div className="text-terminal-muted">Waiting for pipeline events...</div>
           )}
         </div>
