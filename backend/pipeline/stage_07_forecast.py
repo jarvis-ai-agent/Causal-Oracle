@@ -96,63 +96,74 @@ def run(
 
 
 def _run_timesfm(ctx: np.ndarray, horizon: int, emit: Callable):
-    """Attempt TimesFM forecasting, fall back to statistical model."""
+    """TimesFM 2.5 inference with statistical fallback."""
     try:
         import timesfm
-        emit("Attempting TimesFM inference", 0.2)
+        import torch
+        emit("Loading TimesFM 2.5 model weights (first run downloads ~800MB)", 0.2)
 
-        tfm = timesfm.TimesFm(
-            hparams=timesfm.TimesFmHparams(
-                backend="torch",
-                per_core_batch_size=32,
-                horizon_len=horizon,
-                num_layers=20,
-                use_positional_embedding=False,
-                context_len=min(512, len(ctx)),
-            ),
-            checkpoint=timesfm.TimesFmCheckpoint(
-                huggingface_repo_id="google/timesfm-1.0-200m-pytorch"
-            ),
+        model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
+            "google/timesfm-2.5-200m-pytorch"
         )
-        forecast_input = [ctx.tolist()]
-        freq = [0]
-        point_forecast, quantile_forecast = tfm.forecast(forecast_input, freq=freq)
-        emit("TimesFM inference complete", 0.65)
-        return (
-            np.array(point_forecast[0][:horizon]),
-            np.array(quantile_forecast[0][:horizon]),
+        model.compile(
+            timesfm.ForecastConfig(
+                max_context=min(1024, len(ctx)),
+                max_horizon=horizon,
+                normalize_inputs=True,
+                use_continuous_quantile_head=True,
+                force_flip_invariance=True,
+                infer_is_positive=False,     # returns can go negative
+                fix_quantile_crossing=True,
+            )
         )
+
+        emit("Running TimesFM 2.5 inference", 0.5)
+        point_forecast, quantile_forecast = model.forecast(
+            horizon=horizon,
+            inputs=[ctx],
+        )
+        emit("TimesFM 2.5 inference complete", 0.65)
+
+        # point_forecast shape: (1, horizon), quantile_forecast: (1, horizon, n_quantiles)
+        pf = np.array(point_forecast[0][:horizon])
+        qf = np.array(quantile_forecast[0][:horizon])  # (horizon, n_quantiles)
+        if qf.ndim == 1:
+            qf = qf[:, np.newaxis]
+        return pf, qf
+
     except Exception as e:
         logger.warning(f"TimesFM unavailable ({e}), using statistical fallback")
         return _statistical_forecast(ctx, horizon)
 
 
 def _statistical_forecast(ctx: np.ndarray, horizon: int):
-    """Simple statistical forecast: exponential smoothing + noise."""
+    """Exponential smoothing forecast with Gaussian quantile bands."""
     try:
         from statsmodels.tsa.holtwinters import ExponentialSmoothing
-        # Use last 200 points for speed
+        from scipy import stats as scipy_stats
         data = ctx[-min(200, len(ctx)):]
-        model = ExponentialSmoothing(data, trend="add", seasonal=None).fit(optimized=True, disp=False)
-        point = model.forecast(horizon)
-        # Simple quantile bands
-        std = float(np.std(np.diff(data)))
+        # trend="add" requires at least 2 non-nan points
+        model = ExponentialSmoothing(data, trend="add", seasonal=None).fit(optimized=True)
+        point = np.array(model.forecast(horizon))
+        std = float(np.std(np.diff(data))) if len(data) > 1 else 1e-4
         q_levels = np.linspace(0.1, 0.9, 10)
-        from scipy import stats
         quantiles = np.array([
-            [float(point[h] + stats.norm.ppf(q) * std * np.sqrt(h + 1)) for q in q_levels]
+            [float(point[h] + scipy_stats.norm.ppf(q) * std * np.sqrt(h + 1)) for q in q_levels]
             for h in range(horizon)
         ])
-        return np.array(point), quantiles
+        return point, quantiles
     except Exception as e:
-        logger.warning(f"Statistical forecast also failed: {e}")
-        # Last resort: random walk
+        logger.warning(f"Statistical forecast failed: {e}")
+        # Last resort: naive forecast (last observed value, expanding uncertainty)
         last_val = float(ctx[-1]) if len(ctx) > 0 else 0.0
-        std = float(np.std(np.diff(ctx[-50:]))) if len(ctx) > 50 else 0.01
-        point = np.array([last_val + np.random.normal(0, std) for _ in range(horizon)])
-        quantiles = np.zeros((horizon, 10))
-        for h in range(horizon):
-            quantiles[h] = [point[h] + np.random.normal(0, std * (h + 1)) for _ in range(10)]
+        std = float(np.std(np.diff(ctx[-50:]))) if len(ctx) > 50 else 1e-4
+        point = np.full(horizon, last_val)
+        q_levels = np.linspace(0.1, 0.9, 10)
+        from scipy import stats as scipy_stats
+        quantiles = np.array([
+            [float(last_val + scipy_stats.norm.ppf(q) * std * np.sqrt(h + 1)) for q in q_levels]
+            for h in range(horizon)
+        ])
         return point, quantiles
 
 
