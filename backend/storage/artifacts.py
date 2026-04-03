@@ -36,11 +36,17 @@ def load_artifact(run_id: str, name: str) -> Optional[Any]:
     json_path = d / f"{name}.json"
     pkl_path = d / f"{name}.pkl"
     if json_path.exists():
-        with open(json_path) as f:
-            return json.load(f)
+        try:
+            with open(json_path) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load artifact {name} as JSON: {e}")
     if pkl_path.exists():
-        with open(pkl_path, "rb") as f:
-            return pickle.load(f)
+        try:
+            with open(pkl_path, "rb") as f:
+                return pickle.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load artifact {name} as pickle: {e}")
     return None
 
 

@@ -345,7 +345,21 @@ async def export_run(run_id: str):
     from fastapi.responses import JSONResponse
     from utils.serialization import NumpyEncoder
     import json as _json
-    content = _json.dumps(export, cls=NumpyEncoder, indent=2)
+
+    # Safe serialize — replace any unserializable values with an error note
+    try:
+        content = _json.dumps(export, cls=NumpyEncoder, indent=2)
+    except Exception as e:
+        logger.error(f"Export serialization error for {run_id}: {e}")
+        # Strip problematic keys and try again
+        for stage_key in export.get("stages", {}).values():
+            for k in list(stage_key.keys()):
+                try:
+                    _json.dumps(stage_key[k], cls=NumpyEncoder)
+                except Exception:
+                    stage_key[k] = f"[unserializable: {type(stage_key[k]).__name__}]"
+        content = _json.dumps(export, cls=NumpyEncoder, indent=2)
+
     return JSONResponse(
         content=_json.loads(content),
         headers={"Content-Disposition": f'attachment; filename="causal-oracle-{run_id}.json"'}
