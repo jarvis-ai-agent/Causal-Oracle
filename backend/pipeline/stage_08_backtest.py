@@ -51,6 +51,24 @@ def run(
 
     emit("Starting walk-forward backtest", 0.0)
 
+    # --- Filter to predictive (lagged) parents only ---
+    # t0 parents (lag=0) are contemporaneous correlations — you can't trade on them
+    # because you'd need to know their value at time t to predict time t.
+    # Only lag >= 1 parents are true predictive signals.
+    predictive_parents = {}
+    for target, parents in validated_parents.items():
+        lagged = [p for p in parents if p.get("lag", 0) >= 1]
+        predictive_parents[target] = lagged
+
+    n_t0 = sum(len(v) - len(predictive_parents[k]) for k, v in validated_parents.items())
+    n_lag = sum(len(v) for v in predictive_parents.values())
+    emit(f"Filtered parents: {n_lag} predictive (lag≥1), dropped {n_t0} contemporaneous (lag=0)", 0.02)
+
+    if n_lag == 0:
+        emit("WARNING: No lagged causal parents found — all parents are contemporaneous (t0). "
+             "Signals will be driven by TimesFM/ARIMA only. "
+             "Try increasing Max Lag or using RCoT independence test.", 0.03)
+
     # Use raw (un-normalized) returns for P&L calculation
     # Fall back to features_df only if raw_returns_df not provided
     returns_source = raw_returns_df if raw_returns_df is not None else features_df
@@ -103,6 +121,9 @@ def run(
         if t - last_forecast_t >= forecast_retrain_interval:
             try:
                 from pipeline.stage_07_forecast import _statistical_forecast, _run_arima
+                # NOTE: Use fast statistical forecast + ARIMA inside the backtest loop.
+                # TimesFM is too slow (~2s/call) for walk-forward which needs hundreds of calls.
+                # TimesFM is used in Stage 07 for the final forward-looking forecast.
                 point_fc, quant_fc = _statistical_forecast(ctx, horizon)
                 arima_fc = _run_arima(ctx, horizon)
 
@@ -149,6 +170,30 @@ def run(
         # Override to flat if uncertainty is extreme
         if uncertainty_ratio > 10.0:
             signal = "FLAT"
+
+        # --- Lagged parent confirmation ---
+        # If we have predictive (lag≥1) parents, use their current values
+        # to confirm or veto the TimesFM signal.
+        # A lagged parent with strong positive value pointing to LONG confirms it;
+        # strong negative value pointing opposite vetoes it.
+        target_key = list(predictive_parents.keys())[0] if predictive_parents else None
+        if signal != "FLAT" and target_key and predictive_parents[target_key]:
+            parent_votes = []
+            for p in predictive_parents[target_key]:
+                col = p["name"]
+                if col in features_df.columns and t < len(features_df):
+                    val = float(features_df[col].iloc[t])
+                    if not np.isnan(val):
+                        # Positive parent value with strength > 0.15 = bullish vote
+                        # Negative parent value with strength > 0.15 = bearish vote
+                        if p["strength"] >= 0.15:
+                            parent_votes.append(np.sign(val))
+            if parent_votes:
+                parent_direction = np.sign(np.mean(parent_votes))
+                signal_direction = 1.0 if signal == "LONG" else -1.0
+                # If parent votes strongly oppose signal, go flat
+                if parent_direction != 0 and parent_direction != signal_direction:
+                    signal = "FLAT"
 
         # Determine regime at this point
         regime_idx = int(regime_labels[t]) if t < len(regime_labels) else 0
