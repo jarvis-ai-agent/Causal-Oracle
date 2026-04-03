@@ -349,12 +349,14 @@ class PipelineOrchestrator:
             raw_returns_df=features.raw_returns_df,
             validated_parents=validation.validated_parents,
             regime_labels=regime.regime_labels,
+            regime_map=regime.regime_map,
             target_col=self.config.target,
             initial_capital=self.config.initial_capital,
             horizon=self.config.horizon,
             causal_retrain_interval=self.config.causal_retrain_interval,
             forecast_retrain_interval=self.config.forecast_retrain_interval,
             signal_direction=getattr(self.config, "signal_direction", "both"),
+            min_expected_return=getattr(self.config, "min_expected_return", 0.0015),
         )
         self._stage_data["backtest"] = result
 

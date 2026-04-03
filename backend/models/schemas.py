@@ -21,6 +21,8 @@ class PipelineConfig(BaseModel):
     include_factors: bool = Field(default=False)
     # Signal direction: "both" | "long_only" | "short_only"
     signal_direction: str = Field(default="both")
+    # Minimum avg |expected daily return| to enter a trade (0 = disabled)
+    min_expected_return: float = Field(default=0.0005, ge=0.0, le=0.05)
 
 
 class StageStatus(BaseModel):
