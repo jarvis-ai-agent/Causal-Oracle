@@ -354,6 +354,7 @@ class PipelineOrchestrator:
             horizon=self.config.horizon,
             causal_retrain_interval=self.config.causal_retrain_interval,
             forecast_retrain_interval=self.config.forecast_retrain_interval,
+            signal_direction=getattr(self.config, "signal_direction", "both"),
         )
         self._stage_data["backtest"] = result
 

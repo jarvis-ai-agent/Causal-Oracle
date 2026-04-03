@@ -16,6 +16,7 @@ const DEFAULT_CONFIG = {
   forecast_retrain_interval: 5,
   include_macro: true,
   include_factors: false,
+  signal_direction: 'both',
 }
 
 export const usePipelineStore = create((set, get) => ({

@@ -16,9 +16,11 @@ class PipelineConfig(BaseModel):
     context_length: int = Field(default=1024)
     initial_capital: float = Field(default=100000.0)
     causal_retrain_interval: int = Field(default=60)
-    forecast_retrain_interval: int = Field(default=5)
+    forecast_retrain_interval: int = Field(default=3)
     include_macro: bool = Field(default=True)
     include_factors: bool = Field(default=False)
+    # Signal direction: "both" | "long_only" | "short_only"
+    signal_direction: str = Field(default="both")
 
 
 class StageStatus(BaseModel):

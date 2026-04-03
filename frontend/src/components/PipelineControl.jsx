@@ -225,6 +225,28 @@ export default function PipelineControl() {
                     className="bg-terminal-panel border border-terminal-border rounded px-2 py-1 text-xs w-full focus:outline-none focus:border-terminal-accent"
                   />
                 </div>
+                <div>
+                  <label className="block text-xs text-terminal-muted mb-1">Signal Direction</label>
+                  <div className="flex gap-1">
+                    {[
+                      { value: 'both',       label: '↕ Both' },
+                      { value: 'long_only',  label: '↑ Long Only' },
+                      { value: 'short_only', label: '↓ Short Only' },
+                    ].map(opt => (
+                      <button
+                        key={opt.value}
+                        onClick={() => setConfig({ signal_direction: opt.value })}
+                        className={`flex-1 py-1.5 rounded text-xs border transition-colors ${
+                          config.signal_direction === opt.value
+                            ? 'bg-terminal-accent text-terminal-bg border-terminal-accent font-bold'
+                            : 'bg-terminal-panel text-terminal-muted border-terminal-border hover:border-terminal-accent'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 <div className="col-span-2 flex gap-4">
                   <label className="flex items-center gap-2 text-xs cursor-pointer">
                     <input type="checkbox" checked={config.include_macro}
