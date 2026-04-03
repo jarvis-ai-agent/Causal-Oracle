@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 import { usePipelineStore } from '../store/pipelineStore'
 import { useApi } from '../hooks/useApi'
 import { fmtDate, fmtDateTime, fmtDuration } from '../utils/formatting'
+import SuggestedPairings from './SuggestedPairings'
 
 const TICKERS_PRESETS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'SPY', 'QQQ', 'GLD', 'TLT']
 
@@ -91,7 +92,7 @@ export default function PipelineControl() {
 
   return (
     <div className="flex gap-4 h-full p-4 overflow-auto">
-      {/* Config panel */}
+      {/* Config panel + Suggested Pairings */}
       <div className="flex-1 flex flex-col gap-4 min-w-0">
         <div className="panel">
           <div className="panel-header">Pipeline Configuration</div>
@@ -283,6 +284,9 @@ export default function PipelineControl() {
             </button>
           </div>
         </div>
+
+        {/* Suggested Pairings — below main config */}
+        <SuggestedPairings />
       </div>
 
       {/* Previous runs */}
