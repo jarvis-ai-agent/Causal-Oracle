@@ -272,21 +272,23 @@ def run(
 
                 # ── Ensemble by regime ────────────────────────────────────────
                 if hmm_regime_name == "trending":
-                    # TimesFM is primary in trending — it was trained for trend
-                    # extrapolation and proved 64% WR here historically.
-                    # Chronos acts as a veto: only override TimesFM if Chronos
-                    # strongly disagrees (opposite direction) — otherwise follow
-                    # TimesFM fully. Averaging dilutes the TimesFM edge.
+                    # TimesFM is primary in trending — proved 64% WR historically.
+                    # Chronos acts as a hard veto: if both models have strong
+                    # directional signals that oppose each other, skip the trade
+                    # entirely (set point_fc to zeros → fails consistency filter).
+                    # If Chronos is neutral or agrees, follow TimesFM fully.
                     if tf_point is not None:
                         point_fc, quant_fc = tf_point, tf_quant
                         if ch_point is not None:
                             tf_dir = np.sign(np.mean(tf_point))
                             ch_dir = np.sign(np.mean(ch_point))
-                            if tf_dir != 0 and ch_dir != 0 and tf_dir != ch_dir:
-                                # Strong disagreement → widen quantile bands to
-                                # reduce conviction, let the conviction filter decide
+                            tf_strong = abs(np.mean(tf_point)) > min_expected_return
+                            ch_strong = abs(np.mean(ch_point)) > min_expected_return
+                            if tf_dir != 0 and ch_dir != 0 and tf_dir != ch_dir and tf_strong and ch_strong:
+                                # Hard veto: clear the forecast so signal goes FLAT
+                                point_fc = np.zeros(horizon)
                                 if quant_fc is not None:
-                                    quant_fc = quant_fc * 1.4
+                                    quant_fc = np.zeros_like(quant_fc)
                     else:
                         point_fc, quant_fc = ch_point, ch_quant
 
