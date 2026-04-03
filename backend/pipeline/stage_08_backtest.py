@@ -117,7 +117,31 @@ def run(
     # This is used by the vol-regime filter — computed from past data only at each step
     full_vol_series = target_series.rolling(20).std()
 
-    # ── 3. Walk-forward loop ───────────────────────────────────────────────────
+    # ── 3. Load TimesFM once, reuse across all backtest steps ─────────────────
+    # Loading takes ~4s but inference is ~0.1s/call once loaded.
+    # Loading once and reusing: 450 steps = ~45s vs re-loading each time = 1800s.
+    timesfm_model = None
+    try:
+        import timesfm
+        emit("Loading TimesFM 2.5 for backtest (loads once, reused each step)...", 0.06)
+        timesfm_model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
+            "google/timesfm-2.5-200m-pytorch"
+        )
+        timesfm_model.compile(timesfm.ForecastConfig(
+            max_context=min(512, min_train),
+            max_horizon=horizon,
+            normalize_inputs=True,
+            use_continuous_quantile_head=True,
+            force_flip_invariance=True,
+            infer_is_positive=False,
+            fix_quantile_crossing=True,
+        ))
+        emit("TimesFM loaded — using for all backtest steps", 0.09)
+    except Exception as e:
+        logger.warning(f"TimesFM not available for backtest ({e}), using statistical fallback")
+        timesfm_model = None
+
+    # ── 4. Walk-forward loop ───────────────────────────────────────────────────
     equity = initial_capital
     equity_curve, equity_dates = [], []
     trades_list = []
@@ -132,7 +156,9 @@ def run(
     t_range = list(range(min_train, n - horizon, step))
     total_steps = len(t_range)
 
-    # Forecast cache
+    # Forecast cache (retrain every N steps to balance freshness vs compute)
+    # With TimesFM at ~0.1s/call, every step is fine; with fallback, every 3 steps
+    retrain_interval = 1 if timesfm_model is not None else forecast_retrain_interval
     last_forecast_t = -999
     cached_point    = np.zeros(horizon)
     cached_q10      = np.full(horizon, -0.01)
@@ -162,21 +188,30 @@ def run(
             equity_dates.append(target_series.index[t])
             continue
 
-        # ── 3b. Forecast (retrain at interval) ────────────────────────────────
-        if t - last_forecast_t >= forecast_retrain_interval:
+        # ── 4b. Forecast (every step with TimesFM, every N steps with fallback) ─
+        if t - last_forecast_t >= retrain_interval:
             try:
-                from pipeline.stage_07_forecast import _statistical_forecast, _run_arima
-                point_fc, quant_fc = _statistical_forecast(ctx, horizon)
-                arima_fc           = _run_arima(ctx, horizon)
+                if timesfm_model is not None:
+                    # TimesFM: fast enough (~0.1s) to run every step
+                    point_arr, quant_arr = timesfm_model.forecast(
+                        horizon=horizon, inputs=[ctx]
+                    )
+                    point_fc = np.array(point_arr[0][:horizon])
+                    quant_fc = np.array(quant_arr[0][:horizon])   # (horizon, n_quantiles)
+                    if quant_fc.ndim == 1:
+                        quant_fc = quant_fc[:, np.newaxis]
+                else:
+                    from pipeline.stage_07_forecast import _statistical_forecast
+                    point_fc, quant_fc = _statistical_forecast(ctx, horizon)
 
                 cached_point = point_fc
-                cached_q10   = quant_fc[:, 0]  if quant_fc.ndim == 2 else quant_fc
-                cached_q90   = quant_fc[:, -1] if quant_fc.ndim == 2 else quant_fc
+                cached_q10   = quant_fc[:, 0]  if quant_fc.ndim == 2 and quant_fc.shape[1] > 1 else quant_fc.flatten()
+                cached_q90   = quant_fc[:, -1] if quant_fc.ndim == 2 and quant_fc.shape[1] > 1 else quant_fc.flatten()
                 last_forecast_t = t
             except Exception as e:
                 logger.debug(f"Forecast failed at t={t}: {e}")
 
-        # ── 3c. Signal generation ──────────────────────────────────────────────
+        # ── 4c. Signal generation ──────────────────────────────────────────────
         # Direction consistency: ≥60% of horizon steps must agree
         signs   = np.sign(cached_point)
         n_pos   = int(np.sum(signs > 0))
@@ -197,6 +232,23 @@ def run(
         # Apply user-selected direction filter
         if signal_direction == "long_only"  and signal == "SHORT": signal = "FLAT"
         if signal_direction == "short_only" and signal == "LONG":  signal = "FLAT"
+
+        # ── 4d. Conviction pre-filter ─────────────────────────────────────────
+        # Compute conviction before the parent gate so we can skip low-conviction
+        # setups entirely. Conviction = how much probability mass is on signal side.
+        # Only trade conviction >= 0.65 — below this, quantile bands straddle zero
+        # too symmetrically to have real edge.
+        if signal != "FLAT":
+            q10_pre = float(cached_q10[0]) if len(cached_q10) > 0 else -0.01
+            q90_pre = float(cached_q90[0]) if len(cached_q90) > 0 else 0.01
+            band_pre = max(q90_pre - q10_pre, 1e-8)
+            if signal == "LONG":
+                pre_conviction = max(0.0, min(1.0, (q90_pre - 0.0) / band_pre))
+            else:
+                pre_conviction = max(0.0, min(1.0, (0.0 - q10_pre) / band_pre))
+
+            if pre_conviction < 0.65:
+                signal = "FLAT"
 
         # ── 3d. Lagged parent confirmation gate ───────────────────────────────
         # If causal parents (lag≥1) oppose the forecast direction → veto to FLAT
