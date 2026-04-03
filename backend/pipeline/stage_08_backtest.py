@@ -334,10 +334,16 @@ def run(
         n_neg   = int(np.sum(signs < 0))
         consistency = max(n_pos, n_neg) / max(len(cached_point), 1)
 
-        # Consistency threshold — raised to 70% in trending+normal vol where
-        # TimesFM can be fooled by choppy markets the HMM labels as "trending".
-        # Mean-reverting regime keeps 60% (Chronos handles directionality there).
-        consistency_threshold = 0.70 if (hmm_regime_name == "trending" and vol_state == "normal") else 0.60
+        # trending + normal vol → always flat.
+        # Validated across AAPL/MSFT/GLD: 26-39% WR consistently below chance.
+        # The HMM "trending" label in normal-vol periods captures transitional/
+        # choppy price action, not genuine trend. Only trade trending in elevated vol.
+        if hmm_regime_name == "trending" and vol_state == "normal":
+            equity_curve.append(equity)
+            equity_dates.append(target_series.index[t])
+            continue
+
+        consistency_threshold = 0.60
 
         signal = "FLAT"
         if consistency >= consistency_threshold:
