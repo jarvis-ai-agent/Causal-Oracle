@@ -384,6 +384,13 @@ def run(
     comparison = _compute_metrics(bh_series, pd.DataFrame(), initial_capital)
     comparison["strategy"] = "buy_and_hold"
 
+    # Cross-fill B&H comparison into strategy metrics
+    metrics["bh_return"]              = comparison.get("total_return", 0.0)
+    metrics["bh_pct_gain"]            = comparison.get("total_return", 0.0)
+    metrics["strategy_outperformance"] = round(
+        metrics.get("total_return", 0.0) - comparison.get("total_return", 0.0), 4
+    )
+
     emit(
         f"Backtest complete: Sharpe={metrics.get('sharpe',0):.2f}  "
         f"WR={metrics.get('win_rate',0)*100:.1f}%  "
@@ -406,38 +413,253 @@ def run(
 
 def _compute_metrics(equity: pd.Series, trades: pd.DataFrame, initial: float) -> Dict:
     if len(equity) < 2:
-        return {"sharpe": 0.0, "max_drawdown": 0.0, "win_rate": 0.0,
-                "profit_factor": 0.0, "total_trades": 0, "avg_hold_days": 0.0,
-                "total_return": 0.0}
+        return {
+            "initial_capital": round(initial, 2),
+            "open_pnl": 0.0, "net_pnl": 0.0, "gross_profit": 0.0, "gross_loss": 0.0,
+            "profit_factor": 0.0, "commission_paid": 0.0, "expected_payoff": 0.0,
+            "bh_return": 0.0, "bh_pct_gain": 0.0, "strategy_outperformance": 0.0,
+            "sharpe": 0.0, "sortino": 0.0, "max_drawdown": 0.0, "win_rate": 0.0,
+            "total_trades": 0, "total_open_trades": 0, "winning_trades": 0,
+            "losing_trades": 0, "avg_pnl": 0.0, "avg_winning_trade": 0.0,
+            "avg_losing_trade": 0.0, "ratio_avg_win_loss": 0.0,
+            "largest_winning_trade": 0.0, "largest_winning_trade_pct": 0.0,
+            "largest_winner_pct_of_gross_profit": 0.0,
+            "largest_losing_trade": 0.0, "largest_losing_trade_pct": 0.0,
+            "largest_loser_pct_of_gross_loss": 0.0,
+            "avg_bars_in_trades": 0.0, "avg_bars_in_winning_trades": 0.0,
+            "avg_bars_in_losing_trades": 0.0,
+            "cagr": 0.0, "return_on_initial_capital": 0.0,
+            "account_size_required": 0.0, "return_on_account_size_required": 0.0,
+            "net_profit_pct_of_largest_loss": 0.0,
+            "avg_margin_used": 0.0, "max_margin_used": 0.0,
+            "margin_efficiency": 0.0, "margin_calls": 0,
+            "avg_equity_runup_duration": 0.0, "avg_equity_runup": 0.0,
+            "max_equity_runup_close": 0.0, "max_equity_runup_intrabar": 0.0,
+            "max_equity_runup_pct_initial": 0.0,
+            "avg_equity_drawdown_duration": 0.0, "avg_equity_drawdown_close": 0.0,
+            "max_equity_drawdown_close": 0.0, "max_equity_drawdown_intrabar": 0.0,
+            "max_equity_drawdown_pct_initial": 0.0,
+            "return_of_max_drawdown": 0.0,
+            "avg_hold_days": 0.0, "total_return": 0.0,
+        }
+
+    # ── Returns & equity basics ───────────────────────────────────────────────
+    final_equity  = float(equity.iloc[-1])
+    net_pnl       = final_equity - initial
+    total_return  = net_pnl / initial if initial > 0 else 0.0
 
     returns = equity.pct_change().dropna()
-    sharpe  = float(returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0.0
 
+    # ── Sharpe ────────────────────────────────────────────────────────────────
+    sharpe = float(returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0.0
+
+    # ── Sortino (downside-only std) ───────────────────────────────────────────
+    downside = returns[returns < 0]
+    downside_std = float(downside.std()) if len(downside) > 1 else 0.0
+    sortino = float(returns.mean() / downside_std * np.sqrt(252)) if downside_std > 0 else 0.0
+
+    # ── Drawdown (close-to-close) ─────────────────────────────────────────────
     peak     = equity.cummax()
-    drawdown = (equity - peak) / peak
-    max_dd   = float(drawdown.min())
-    total_return = float((equity.iloc[-1] - initial) / initial)
+    drawdown_series = (equity - peak) / peak
+    max_dd   = float(drawdown_series.min())                   # most negative
+    max_dd_abs = float((peak - equity).max())                 # dollar peak-to-trough
 
+    # Drawdown segments: duration and average
+    in_dd    = drawdown_series < 0
+    dd_durations, dd_depths = [], []
+    run_len, run_depth = 0, 0.0
+    for in_d, depth in zip(in_dd, drawdown_series):
+        if in_d:
+            run_len += 1
+            run_depth = min(run_depth, depth)
+        else:
+            if run_len > 0:
+                dd_durations.append(run_len)
+                dd_depths.append(run_depth)
+            run_len, run_depth = 0, 0.0
+    if run_len > 0:
+        dd_durations.append(run_len)
+        dd_depths.append(run_depth)
+
+    avg_dd_duration = float(np.mean(dd_durations)) if dd_durations else 0.0
+    avg_dd_close    = float(np.mean(dd_depths))    if dd_depths    else 0.0
+
+    # Intrabar approximation: use the worst-case daily close as intrabar proxy
+    max_dd_intrabar = max_dd
+    max_dd_intrabar_pct_initial = abs(max_dd_intrabar) * float(equity.max()) / initial if initial > 0 else 0.0
+
+    # ── Run-up (close-to-close) ────────────────────────────────────────────────
+    trough   = equity.cummin()
+    runup_series = (equity - trough) / trough.clip(lower=1e-8)
+    max_runup = float(runup_series.max())
+
+    in_ru    = runup_series > 0
+    ru_durations, ru_depths = [], []
+    run_len, run_depth = 0, 0.0
+    for in_r, depth in zip(in_ru, runup_series):
+        if in_r:
+            run_len += 1
+            run_depth = max(run_depth, depth)
+        else:
+            if run_len > 0:
+                ru_durations.append(run_len)
+                ru_depths.append(run_depth)
+            run_len, run_depth = 0, 0.0
+    if run_len > 0:
+        ru_durations.append(run_len)
+        ru_depths.append(run_depth)
+
+    avg_ru_duration = float(np.mean(ru_durations)) if ru_durations else 0.0
+    avg_ru_close    = float(np.mean(ru_depths))    if ru_depths    else 0.0
+    max_ru_intrabar = max_runup
+    max_ru_pct_initial = max_runup * float(equity.min()) / initial if initial > 0 else 0.0
+
+    # ── CAGR ─────────────────────────────────────────────────────────────────
+    n_periods = len(equity)
+    years = n_periods / 252.0
+    cagr = float((final_equity / initial) ** (1 / years) - 1) if years > 0 and initial > 0 else 0.0
+
+    # ── Trade-level metrics ───────────────────────────────────────────────────
     if len(trades) > 0 and "pnl" in trades.columns:
-        profitable   = (trades["pnl"] > 0).sum()
-        total_t      = len(trades)
-        win_rate     = float(profitable / total_t) if total_t > 0 else 0.0
-        gross_profit = trades.loc[trades["pnl"] > 0, "pnl"].sum()
-        gross_loss   = abs(trades.loc[trades["pnl"] < 0, "pnl"].sum())
-        profit_factor = float(gross_profit / gross_loss) if gross_loss > 0 else float(gross_profit)
-        avg_hold     = float(trades["horizon"].mean()) if "horizon" in trades.columns else 0.0
+        pnls         = trades["pnl"].values
+        winning      = trades[trades["pnl"] > 0]
+        losing       = trades[trades["pnl"] < 0]
+        n_total      = len(trades)
+        n_winning    = len(winning)
+        n_losing     = len(losing)
+        win_rate     = float(n_winning / n_total) if n_total > 0 else 0.0
+
+        gross_profit = float(winning["pnl"].sum()) if n_winning > 0 else 0.0
+        gross_loss   = float(abs(losing["pnl"].sum())) if n_losing > 0 else 0.0
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
+
+        avg_pnl          = float(np.mean(pnls))
+        avg_win          = float(winning["pnl"].mean()) if n_winning > 0 else 0.0
+        avg_loss_val     = float(losing["pnl"].mean())  if n_losing  > 0 else 0.0
+        ratio_win_loss   = abs(avg_win / avg_loss_val) if avg_loss_val != 0 else 0.0
+        expected_payoff  = float(win_rate * avg_win + (1 - win_rate) * avg_loss_val)
+
+        largest_win      = float(winning["pnl"].max()) if n_winning > 0 else 0.0
+        largest_loss     = float(losing["pnl"].min())  if n_losing  > 0 else 0.0
+
+        # Percent-based per-trade: pnl / size
+        if "size" in trades.columns:
+            winning_pct_col = winning["pnl"] / winning["size"].clip(lower=1e-8)
+            losing_pct_col  = losing["pnl"]  / losing["size"].clip(lower=1e-8)
+            largest_win_pct  = float(winning_pct_col.max()) if n_winning > 0 else 0.0
+            largest_loss_pct = float(losing_pct_col.min())  if n_losing  > 0 else 0.0
+        else:
+            largest_win_pct = largest_loss_pct = 0.0
+
+        largest_win_pct_of_gp  = (largest_win  / gross_profit * 100) if gross_profit > 0 else 0.0
+        largest_loss_pct_of_gl = (abs(largest_loss) / gross_loss * 100) if gross_loss > 0 else 0.0
+
+        avg_hold = float(trades["horizon"].mean()) if "horizon" in trades.columns else 0.0
+        avg_win_hold  = float(winning["horizon"].mean()) if n_winning > 0 and "horizon" in winning.columns else avg_hold
+        avg_loss_hold = float(losing["horizon"].mean())  if n_losing  > 0 and "horizon" in losing.columns  else avg_hold
+
+        # Margin: use position size as proxy for margin used
+        if "size" in trades.columns:
+            avg_margin = float(trades["size"].mean())
+            max_margin = float(trades["size"].max())
+        else:
+            avg_margin = max_margin = 0.0
+        margin_efficiency = net_pnl / avg_margin if avg_margin > 0 else 0.0
+        margin_calls = 0  # No leverage model yet; placeholder
+
+        net_profit_pct_largest_loss = (net_pnl / abs(largest_loss) * 100) if largest_loss != 0 else 0.0
     else:
-        win_rate = profit_factor = avg_hold = 0.0
-        total_t  = 0
+        n_total = n_winning = n_losing = 0
+        win_rate = profit_factor = avg_pnl = avg_win = avg_loss_val = 0.0
+        ratio_win_loss = expected_payoff = 0.0
+        gross_profit = gross_loss = 0.0
+        largest_win = largest_loss = largest_win_pct = largest_loss_pct = 0.0
+        largest_win_pct_of_gp = largest_loss_pct_of_gl = 0.0
+        avg_hold = avg_win_hold = avg_loss_hold = 0.0
+        avg_margin = max_margin = margin_efficiency = 0.0
+        margin_calls = 0
+        net_profit_pct_largest_loss = 0.0
+
+    # ── Account size required (initial capital + max drawdown buffer) ─────────
+    account_size_required = initial + abs(max_dd * initial)
+    return_on_account_size = net_pnl / account_size_required if account_size_required > 0 else 0.0
+
+    # ── Return of max drawdown (recovery) ─────────────────────────────────────
+    return_of_max_dd = total_return / abs(max_dd) if max_dd != 0 else 0.0
+
+    def r(v, d=4):
+        try:
+            return round(float(v), d)
+        except Exception:
+            return 0.0
 
     return {
-        "sharpe":        round(sharpe, 4),
-        "max_drawdown":  round(max_dd, 4),
-        "win_rate":      round(win_rate, 4),
-        "profit_factor": round(profit_factor, 4),
-        "total_trades":  int(total_t),
-        "avg_hold_days": round(avg_hold, 2),
-        "total_return":  round(total_return, 4),
+        # Capital
+        "initial_capital":               r(initial, 2),
+        "open_pnl":                      0.0,   # live trading only; always 0 in backtest
+        "net_pnl":                       r(net_pnl, 2),
+        "gross_profit":                  r(gross_profit, 2),
+        "gross_loss":                    r(gross_loss, 2),
+        "profit_factor":                 r(profit_factor),
+        "commission_paid":               0.0,   # placeholder — no commission model yet
+        "expected_payoff":               r(expected_payoff, 2),
+        # B&H / outperformance (populated at call site)
+        "bh_return":                     0.0,
+        "bh_pct_gain":                   0.0,
+        "strategy_outperformance":       0.0,
+        # Risk-adjusted
+        "sharpe":                        r(sharpe),
+        "sortino":                       r(sortino),
+        # Trade counts
+        "total_trades":                  int(n_total),
+        "total_open_trades":             0,     # closed-only backtest
+        "winning_trades":                int(n_winning),
+        "losing_trades":                 int(n_losing),
+        "win_rate":                      r(win_rate),
+        # P&L averages
+        "avg_pnl":                       r(avg_pnl, 2),
+        "avg_winning_trade":             r(avg_win, 2),
+        "avg_losing_trade":              r(avg_loss_val, 2),
+        "ratio_avg_win_loss":            r(ratio_win_loss),
+        # Largest trades
+        "largest_winning_trade":         r(largest_win, 2),
+        "largest_winning_trade_pct":     r(largest_win_pct * 100, 4),
+        "largest_winner_pct_of_gross_profit": r(largest_win_pct_of_gp, 2),
+        "largest_losing_trade":          r(largest_loss, 2),
+        "largest_losing_trade_pct":      r(largest_loss_pct * 100, 4),
+        "largest_loser_pct_of_gross_loss": r(largest_loss_pct_of_gl, 2),
+        # Bar counts
+        "avg_bars_in_trades":            r(avg_hold, 2),
+        "avg_bars_in_winning_trades":    r(avg_win_hold, 2),
+        "avg_bars_in_losing_trades":     r(avg_loss_hold, 2),
+        # Returns / sizing
+        "cagr":                          r(cagr),
+        "return_on_initial_capital":     r(total_return),
+        "account_size_required":         r(account_size_required, 2),
+        "return_on_account_size_required": r(return_on_account_size),
+        "net_profit_pct_of_largest_loss": r(net_profit_pct_largest_loss, 2),
+        # Margin
+        "avg_margin_used":               r(avg_margin, 2),
+        "max_margin_used":               r(max_margin, 2),
+        "margin_efficiency":             r(margin_efficiency),
+        "margin_calls":                  int(margin_calls),
+        # Run-up
+        "avg_equity_runup_duration":     r(avg_ru_duration, 2),
+        "avg_equity_runup":              r(avg_ru_close, 4),
+        "max_equity_runup_close":        r(max_runup, 4),
+        "max_equity_runup_intrabar":     r(max_ru_intrabar, 4),
+        "max_equity_runup_pct_initial":  r(max_ru_pct_initial * 100, 2),
+        # Drawdown
+        "avg_equity_drawdown_duration":  r(avg_dd_duration, 2),
+        "avg_equity_drawdown_close":     r(avg_dd_close, 4),
+        "max_equity_drawdown_close":     r(max_dd, 4),
+        "max_equity_drawdown_intrabar":  r(max_dd_intrabar, 4),
+        "max_equity_drawdown_pct_initial": r(max_dd_intrabar_pct_initial * 100, 2),
+        "return_of_max_drawdown":        r(return_of_max_dd, 4),
+        # Legacy keys (kept for backward compat with existing charts)
+        "max_drawdown":                  r(max_dd),
+        "total_return":                  r(total_return),
+        "avg_hold_days":                 r(avg_hold, 2),
     }
 
 

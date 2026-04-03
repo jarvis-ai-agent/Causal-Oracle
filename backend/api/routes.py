@@ -366,6 +366,39 @@ async def export_run(run_id: str):
     )
 
 
+_AV_KEY = "P2UE8R8FJ5DD89DN"
+
+@router.get("/search")
+async def search_symbols(q: str):
+    """Search for stock symbols using AlphaVantage SYMBOL_SEARCH."""
+    if not q or len(q.strip()) < 1:
+        return []
+    try:
+        import httpx
+        url = (
+            f"https://www.alphavantage.co/query"
+            f"?function=SYMBOL_SEARCH&keywords={q.strip()}&apikey={_AV_KEY}"
+        )
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(url)
+            data = resp.json()
+        matches = data.get("bestMatches", [])
+        return [
+            {
+                "symbol":   m.get("1. symbol", ""),
+                "name":     m.get("2. name", ""),
+                "type":     m.get("3. type", ""),
+                "region":   m.get("4. region", ""),
+                "currency": m.get("8. currency", ""),
+            }
+            for m in matches
+            if m.get("1. symbol")
+        ]
+    except Exception as e:
+        logger.warning(f"Symbol search failed for '{q}': {e}")
+        return []
+
+
 @router.get("/health")
 async def health():
     return {"status": "ok", "service": "causal-oracle"}

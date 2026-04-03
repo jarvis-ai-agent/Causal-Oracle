@@ -3,6 +3,7 @@ import { usePipelineStore } from '../store/pipelineStore'
 import { useApi } from '../hooks/useApi'
 import { fmtDate, fmtDateTime, fmtDuration } from '../utils/formatting'
 import SuggestedPairings from './SuggestedPairings'
+import TickerSearch from './TickerSearch'
 
 const TICKERS_PRESETS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'SPY', 'QQQ', 'GLD', 'TLT']
 
@@ -27,7 +28,6 @@ export default function PipelineControl() {
   const [advanced, setAdvanced] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
-  const [tickerInput, setTickerInput] = useState('')
 
   const addTicker = (t) => {
     const ticker = t.trim().toUpperCase()
@@ -109,23 +109,18 @@ export default function PipelineControl() {
                   </span>
                 ))}
               </div>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={tickerInput}
-                  onChange={e => setTickerInput(e.target.value.toUpperCase())}
-                  onKeyDown={e => e.key === 'Enter' && addTicker(tickerInput)}
-                  placeholder="Add ticker..."
-                  className="bg-terminal-surface border border-terminal-border rounded px-3 py-1.5 text-xs text-terminal-text w-28 focus:outline-none focus:border-terminal-accent"
+              <div className="flex flex-col gap-2">
+                <TickerSearch
+                  onSelect={addTicker}
+                  placeholder="Search ticker or company..."
                 />
-                <button onClick={() => addTicker(tickerInput)} className="px-3 py-1.5 bg-terminal-surface border border-terminal-border rounded text-xs hover:border-terminal-accent">
-                  Add
-                </button>
-                {TICKERS_PRESETS.filter(t => !config.tickers.includes(t)).slice(0, 4).map(t => (
-                  <button key={t} onClick={() => addTicker(t)} className="px-2 py-1.5 bg-terminal-surface border border-terminal-border rounded text-xs text-terminal-muted hover:text-terminal-text hover:border-terminal-accent">
-                    +{t}
-                  </button>
-                ))}
+                <div className="flex flex-wrap gap-1">
+                  {TICKERS_PRESETS.filter(t => !config.tickers.includes(t)).slice(0, 5).map(t => (
+                    <button key={t} onClick={() => addTicker(t)} className="px-2 py-1 bg-terminal-surface border border-terminal-border rounded text-xs text-terminal-muted hover:text-terminal-text hover:border-terminal-accent">
+                      +{t}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
 
