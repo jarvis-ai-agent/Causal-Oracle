@@ -120,21 +120,34 @@ def run(
 
         # Generate signal for next horizon steps
         point_1 = cached_point[0] if len(cached_point) > 0 else 0.0
+
+        # Signal logic — use forecast direction + quantile agreement, not magnitude threshold
+        # TimesFM returns are small (avg 0.05% vs 1.3% daily vol) — magnitude thresholds kill all signals
+        # Instead: signal if majority of forecast horizon agrees on direction
+        horizon_signs = np.sign(cached_point)
+        n_pos = np.sum(horizon_signs > 0)
+        n_neg = np.sum(horizon_signs < 0)
+        direction_consistency = max(n_pos, n_neg) / max(len(cached_point), 1)
+
+        # Quantile check: q10 > 0 means even the pessimistic scenario is positive (strong LONG)
+        # q90 < 0 means even the optimistic scenario is negative (strong SHORT)
         q10_1 = cached_q10[0] if len(cached_q10) > 0 else -0.01
         q90_1 = cached_q90[0] if len(cached_q90) > 0 else 0.01
 
-        # Uncertainty: normalise by rolling std of returns so threshold is scale-invariant
+        # Uncertainty filter: reject if bands are extreme (> 10x typical daily move)
         rolling_std = float(np.std(train_data.values[-20:])) if len(train_data) >= 20 else 0.01
         uncertainty = float(np.mean(cached_q90 - cached_q10))
         uncertainty_ratio = uncertainty / max(rolling_std, 1e-8)
 
-        # Signal logic — require directional conviction, not strict ensemble agreement
         signal = "FLAT"
-        if point_1 > rolling_std * 0.3:          # predicted move > 30% of typical daily move
-            signal = "LONG"
-        elif point_1 < -rolling_std * 0.3:
-            signal = "SHORT"
-        if uncertainty_ratio > 4.0:               # bands too wide relative to typical vol
+        # Strong signal: 60%+ of horizon steps agree on direction AND point forecast non-zero
+        if direction_consistency >= 0.6:
+            if n_pos > n_neg and point_1 >= 0:
+                signal = "LONG"
+            elif n_neg > n_pos and point_1 <= 0:
+                signal = "SHORT"
+        # Override to flat if uncertainty is extreme
+        if uncertainty_ratio > 10.0:
             signal = "FLAT"
 
         # Determine regime at this point
