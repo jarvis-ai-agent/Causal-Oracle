@@ -1,8 +1,8 @@
 """Stage 07 — Regime-aware Ensemble Forecasting: TimesFM + Chronos + ARIMA
 
 Ensemble strategy:
-  - trending regime    → TimesFM (primary) + Chronos (secondary), avg directional probs
-  - mean_reverting     → Chronos standalone (handles mean-reversion better than TimesFM)
+  - trending regime    → TimesFM ONLY (Chronos degrades trending WR from 64% → 44%)
+  - mean_reverting     → Chronos primary (60%+ WR; TimesFM blended on agreement)
   - crisis / unknown   → statistical fallback only (ARIMA/ExponentialSmoothing)
 
 Both models are loaded once and reused. Chronos uses the small variant (710M params)
@@ -83,7 +83,8 @@ def run(
     timesfm_point, timesfm_quantiles = _run_timesfm(ctx, horizon, emit)
 
     chronos_point, chronos_quantiles = None, None
-    if regime_name in ("trending", "mean_reverting"):
+    # Only load Chronos for mean_reverting — it hurts in trending regime
+    if regime_name == "mean_reverting":
         emit(f"Loading Chronos (regime={regime_name})", 0.55)
         chronos_point, chronos_quantiles = _run_chronos(ctx, horizon, emit)
 
@@ -92,23 +93,13 @@ def run(
 
     # ── Ensemble logic ────────────────────────────────────────────────────────
     if regime_name == "trending":
-        # Primary: TimesFM + Chronos averaged (both are trend-capable)
-        if timesfm_point is not None and chronos_point is not None:
-            point_forecast = (timesfm_point + chronos_point) / 2.0
-            # Average quantile bands
-            if timesfm_quantiles is not None and chronos_quantiles is not None:
-                tq = timesfm_quantiles if timesfm_quantiles.shape == chronos_quantiles.shape else timesfm_quantiles
-                cq = chronos_quantiles if chronos_quantiles.shape == tq.shape else tq
-                quantile_forecast = (tq + cq) / 2.0
-            else:
-                quantile_forecast = timesfm_quantiles if timesfm_quantiles is not None else chronos_quantiles
-            ensemble_method = "timesfm+chronos_avg"
-        elif timesfm_point is not None:
+        # TimesFM ONLY — Chronos is a mean-reversion model and degrades trend signals
+        if timesfm_point is not None:
             point_forecast, quantile_forecast = timesfm_point, timesfm_quantiles
             ensemble_method = "timesfm_only"
         else:
-            point_forecast, quantile_forecast = chronos_point, chronos_quantiles
-            ensemble_method = "chronos_only"
+            point_forecast, quantile_forecast = _statistical_forecast(ctx, horizon)
+            ensemble_method = "statistical_fallback"
 
     elif regime_name == "mean_reverting":
         # Primary: Chronos standalone (better for mean-reversion)

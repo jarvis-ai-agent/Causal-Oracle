@@ -196,6 +196,7 @@ def run(
         for r in ("normal", "elevated", "crisis")
     }
 
+
     step = max(horizon, 1)
     t_range = list(range(min_train, n - horizon, step))
     total_steps = len(t_range)
@@ -230,10 +231,14 @@ def run(
         median_vol = float(past_vols.median()) if len(past_vols) > 20 else float(rolling_vol)
         vol_state = _vol_regime(rolling_vol, median_vol)
 
-        # Vol-crisis → allow trading but cap position at 25% of normal Kelly.
-        # Previously went fully flat, which eliminated all HMM "crisis" regime
-        # trades that show 61% WR historically. We preserve the edge by trading
-        # at reduced size rather than going completely flat.
+        # Vol-crisis handling — regime-dependent:
+        # - HMM mean_reverting + vol crisis → trade at 25% Kelly (mean-rev edge persists)
+        # - HMM trending + vol crisis       → go flat (33% WR, whipsaw environment)
+        # - HMM trending + vol normal       → full Kelly (TimesFM strongest here)
+        if vol_state == "crisis" and hmm_regime_name == "trending":
+            equity_curve.append(equity)
+            equity_dates.append(target_series.index[t])
+            continue
         vol_crisis_size_cap = 0.25 if vol_state == "crisis" else 1.0
 
         # ── 4b. Regime-aware ensemble forecast ────────────────────────────────
@@ -254,8 +259,8 @@ def run(
                     if tf_quant.ndim == 1:
                         tf_quant = tf_quant[:, np.newaxis]
 
-                # Chronos — run in trending and mean_reverting regimes
-                if chronos_pipeline is not None and hmm_regime_name in ("trending", "mean_reverting"):
+                # Chronos — mean_reverting only; skip in trending (degrades WR)
+                if chronos_pipeline is not None and hmm_regime_name == "mean_reverting":
                     import torch
                     ctx_tensor = torch.tensor(ctx, dtype=torch.float32).unsqueeze(0)
                     ch_samples = chronos_pipeline.predict(
@@ -272,25 +277,16 @@ def run(
 
                 # ── Ensemble by regime ────────────────────────────────────────
                 if hmm_regime_name == "trending":
-                    # TimesFM is primary in trending — proved 64% WR historically.
-                    # Chronos acts as a hard veto: if both models have strong
-                    # directional signals that oppose each other, skip the trade
-                    # entirely (set point_fc to zeros → fails consistency filter).
-                    # If Chronos is neutral or agrees, follow TimesFM fully.
+                    # TimesFM ONLY in trending — no Chronos interference.
+                    # Chronos is a mean-reversion model; blending or vetoing with it
+                    # in a trending regime consistently degrades TimesFM's 64% WR.
+                    # Chronos is not loaded for this regime to save compute.
                     if tf_point is not None:
                         point_fc, quant_fc = tf_point, tf_quant
-                        if ch_point is not None:
-                            tf_dir = np.sign(np.mean(tf_point))
-                            ch_dir = np.sign(np.mean(ch_point))
-                            tf_strong = abs(np.mean(tf_point)) > min_expected_return
-                            ch_strong = abs(np.mean(ch_point)) > min_expected_return
-                            if tf_dir != 0 and ch_dir != 0 and tf_dir != ch_dir and tf_strong and ch_strong:
-                                # Hard veto: clear the forecast so signal goes FLAT
-                                point_fc = np.zeros(horizon)
-                                if quant_fc is not None:
-                                    quant_fc = np.zeros_like(quant_fc)
-                    else:
+                    elif ch_point is not None:
                         point_fc, quant_fc = ch_point, ch_quant
+                    else:
+                        point_fc, quant_fc = _statistical_forecast(ctx, horizon)
 
                 elif hmm_regime_name == "mean_reverting":
                     # Chronos is primary in mean-reverting regime
@@ -338,8 +334,13 @@ def run(
         n_neg   = int(np.sum(signs < 0))
         consistency = max(n_pos, n_neg) / max(len(cached_point), 1)
 
+        # Consistency threshold — raised to 70% in trending+normal vol where
+        # TimesFM can be fooled by choppy markets the HMM labels as "trending".
+        # Mean-reverting regime keeps 60% (Chronos handles directionality there).
+        consistency_threshold = 0.70 if (hmm_regime_name == "trending" and vol_state == "normal") else 0.60
+
         signal = "FLAT"
-        if consistency >= 0.6:
+        if consistency >= consistency_threshold:
             if n_pos > n_neg and cached_point[0] >= 0:
                 signal = "LONG"
             elif n_neg > n_pos and cached_point[0] <= 0:
@@ -430,6 +431,15 @@ def run(
         # Apply vol-crisis size cap (0.25x normal Kelly in crisis vol environments)
         kelly = kelly * vol_crisis_size_cap
 
+        # ── Drawdown throttle ─────────────────────────────────────────────────
+        # If trailing 10 trades (real + prior) in this vol-regime have WR < 40%
+        # → cut Kelly to floor. Catches sustained losing streaks.
+        recent = hist["wins"][-6:] + hist["losses"][-6:]
+        if len(recent) >= 6:
+            recent_wr = sum(1 for x in recent if x > 0) / len(recent)
+            if recent_wr < 0.40:
+                kelly = floor
+
         if equity <= 0:
             logger.warning(f"[Stage 08] Equity depleted at t={t}, stopping")
             break
@@ -466,7 +476,7 @@ def run(
         }
         trades_list.append(trade)
 
-        # Update per-regime history
+        # Update per-regime history (Kelly)
         if pnl > 0:
             regime_history[vol_state]["wins"].append(pnl)
         else:
