@@ -9,6 +9,7 @@ import BacktestResults from './BacktestResults'
 import RegimeTimeline from './RegimeTimeline'
 import RefutationTable from './RefutationTable'
 import Guide from './Guide'
+import RunsPage from './RunsPage'
 
 const VIEWS = [
   { id: 'control', label: 'Control', icon: '⚙' },
@@ -18,6 +19,7 @@ const VIEWS = [
   { id: 'backtest', label: 'Backtest', icon: '◈' },
   { id: 'regime', label: 'Regimes', icon: '◧' },
   { id: 'validation', label: 'Validation', icon: '◎' },
+  { id: 'runs', label: 'Runs', icon: '☰' },
   { id: 'guide', label: 'Guide', icon: '?' },
 ]
 
@@ -59,6 +61,7 @@ export default function Dashboard() {
     backtest: BacktestResults,
     regime: RegimeTimeline,
     validation: RefutationTable,
+    runs: RunsPage,
     guide: Guide,
   }[activeView] || PipelineControl
 

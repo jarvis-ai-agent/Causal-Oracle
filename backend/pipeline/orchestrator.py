@@ -54,6 +54,7 @@ class PipelineOrchestrator:
         self.config = config
         self.status = "pending"
         self.current_stage = 0
+        self.started_at = None
         self.stage_statuses: Dict[int, dict] = {
             i: {"status": "pending", "duration_sec": None, "output_path": None, "summary": None, "error": None}
             for i in range(1, 9)
@@ -89,9 +90,11 @@ class PipelineOrchestrator:
             "config": self.config.model_dump(),
             "current_stage": self.current_stage,
             "stage_statuses": self.stage_statuses,
-            "logs": self.logs[-200:],  # Keep last 200 log entries
+            "logs": self.logs[-200:],
             "created_at": self.created_at,
+            "started_at": getattr(self, "started_at", None),
             "completed_at": self.completed_at,
+            "total_duration_sec": getattr(self, "total_duration_sec", None),
             "results_available": self.status == "completed",
         }
         await storage_db.save_run(run_data)
@@ -110,7 +113,10 @@ class PipelineOrchestrator:
         return cb
 
     async def run(self):
+        import time as _time
         self.status = "running"
+        self.started_at = iso_now()
+        _pipeline_start = _time.time()
         self._log(f"Pipeline started: tickers={self.config.tickers}, target={self.config.target}")
         await self._save()
         await self._emit("stage_start", 0, 0.0, "Pipeline starting")
@@ -127,12 +133,14 @@ class PipelineOrchestrator:
 
             self.status = "completed"
             self.completed_at = iso_now()
-            self._log("Pipeline completed successfully")
-            await self._emit("pipeline_complete", 8, 1.0, "Pipeline completed successfully")
+            self.total_duration_sec = round(_time.time() - _pipeline_start, 2)
+            self._log(f"Pipeline completed successfully in {self.total_duration_sec}s")
+            await self._emit("pipeline_complete", 8, 1.0, f"Pipeline completed in {self.total_duration_sec}s")
 
         except Exception as e:
             self.status = "failed"
             self.completed_at = iso_now()
+            self.total_duration_sec = round(_time.time() - _pipeline_start, 2)
             err_msg = f"Pipeline failed: {e}\n{traceback.format_exc()}"
             self._log(err_msg, level="ERROR")
             await self._emit("pipeline_error", self.current_stage, 0.0, str(e))

@@ -28,9 +28,15 @@ async def list_runs():
             "status": r["status"],
             "target": cfg.get("target", ""),
             "tickers": cfg.get("tickers", []),
+            "start_date": cfg.get("start_date"),
+            "end_date": cfg.get("end_date"),
             "created_at": r["created_at"],
+            "started_at": r.get("started_at"),
             "completed_at": r.get("completed_at"),
+            "total_duration_sec": r.get("total_duration_sec"),
             "current_stage": r.get("current_stage", 0),
+            "results_available": r.get("results_available", False),
+            "stage_statuses": r.get("stage_statuses", {}),
         })
     return result
 
@@ -165,6 +171,185 @@ async def get_logs(run_id: str):
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     return run.get("logs", [])
+
+
+@router.get("/pipeline/runs/{run_id}/export")
+async def export_run(run_id: str):
+    """Export a complete, well-organised JSON snapshot of every pipeline stage."""
+    run = await storage_db.load_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    cfg = run.get("config", {})
+    stage_statuses = run.get("stage_statuses", {})
+
+    # Compute total duration from stage timings
+    total_sec = sum(
+        (v.get("duration_sec") or 0)
+        for v in stage_statuses.values()
+    )
+
+    export = {
+        "export_version": "1.0",
+        "exported_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        "run": {
+            "id": run_id,
+            "status": run.get("status"),
+            "created_at": run.get("created_at"),
+            "completed_at": run.get("completed_at"),
+            "total_duration_sec": round(total_sec, 2),
+        },
+        "configuration": {
+            "tickers": cfg.get("tickers", []),
+            "target": cfg.get("target"),
+            "date_range": {
+                "start": cfg.get("start_date"),
+                "end": cfg.get("end_date"),
+            },
+            "model_params": {
+                "max_lag": cfg.get("max_lag"),
+                "alpha": cfg.get("alpha"),
+                "independence_test": cfg.get("indep_test"),
+                "n_regimes": cfg.get("n_regimes"),
+                "forecast_horizon": cfg.get("horizon"),
+                "context_length": cfg.get("context_length"),
+            },
+            "backtest_params": {
+                "initial_capital": cfg.get("initial_capital"),
+                "causal_retrain_interval": cfg.get("causal_retrain_interval"),
+                "forecast_retrain_interval": cfg.get("forecast_retrain_interval"),
+            },
+            "data_sources": {
+                "include_macro": cfg.get("include_macro"),
+                "include_fama_french": cfg.get("include_factors"),
+            },
+        },
+        "stages": {},
+        "results": {},
+        "logs": run.get("logs", []),
+    }
+
+    # Stage metadata & timings
+    stage_names = {
+        "1": "data_ingestion", "2": "feature_engineering", "3": "lag_matrix",
+        "4": "causal_discovery", "5": "causal_validation", "6": "regime_detection",
+        "7": "forecasting", "8": "backtesting",
+    }
+    for k, name in stage_names.items():
+        st = stage_statuses.get(k, stage_statuses.get(int(k), {}))
+        export["stages"][name] = {
+            "status": st.get("status", "pending"),
+            "duration_sec": st.get("duration_sec"),
+            "summary": st.get("summary"),
+            "error": st.get("error"),
+        }
+
+    # Stage 01 — ingest metadata
+    ingest_meta = artifacts.load_artifact(run_id, "stage01_metadata")
+    if ingest_meta:
+        export["stages"]["data_ingestion"]["metadata"] = ingest_meta
+
+    # Stage 02 — features
+    feat_names = artifacts.load_artifact(run_id, "stage02_feature_names")
+    stationarity = artifacts.load_artifact(run_id, "stage02_stationarity")
+    if feat_names:
+        export["stages"]["feature_engineering"]["feature_names"] = feat_names
+    if stationarity:
+        export["stages"]["feature_engineering"]["stationarity_report"] = stationarity
+
+    # Stage 03 — lag matrix config
+    lag_config = artifacts.load_artifact(run_id, "stage03_lag_config")
+    lag_cols = artifacts.load_artifact(run_id, "stage03_column_names")
+    if lag_config:
+        export["stages"]["lag_matrix"]["config"] = lag_config
+    if lag_cols:
+        export["stages"]["lag_matrix"]["columns"] = lag_cols
+
+    # Stage 04 — causal discovery
+    graph = artifacts.load_artifact(run_id, "stage04_graph")
+    causal_parents = artifacts.load_artifact(run_id, "stage04_causal_parents")
+    discovery_meta = artifacts.load_artifact(run_id, "stage04_metadata")
+    if graph:
+        export["stages"]["causal_discovery"]["graph"] = graph
+    if causal_parents:
+        export["stages"]["causal_discovery"]["causal_parents"] = causal_parents
+    if discovery_meta:
+        export["stages"]["causal_discovery"]["metadata"] = discovery_meta
+
+    # Stage 05 — validation
+    validated = artifacts.load_artifact(run_id, "stage05_validated_parents")
+    dropped = artifacts.load_artifact(run_id, "stage05_dropped_parents")
+    val_meta = artifacts.load_artifact(run_id, "stage05_metadata")
+    refutation = artifacts.load_artifact(run_id, "stage05_refutation_report")
+    if validated:
+        export["stages"]["causal_validation"]["validated_parents"] = validated
+    if dropped:
+        export["stages"]["causal_validation"]["dropped_parents"] = dropped
+    if val_meta:
+        export["stages"]["causal_validation"]["metadata"] = val_meta
+    if refutation:
+        export["stages"]["causal_validation"]["refutation_report"] = refutation
+
+    # Stage 06 — regimes
+    regime_map = artifacts.load_artifact(run_id, "stage06_regime_map")
+    transition = artifacts.load_artifact(run_id, "stage06_transition_matrix")
+    distribution = artifacts.load_artifact(run_id, "stage06_distribution")
+    current_regime = artifacts.load_artifact(run_id, "stage06_current_regime")
+    regime_labels = artifacts.load_artifact(run_id, "stage06_regime_labels")
+    if regime_map:
+        export["stages"]["regime_detection"]["regime_map"] = regime_map
+    if transition:
+        export["stages"]["regime_detection"]["transition_matrix"] = transition
+    if distribution:
+        export["stages"]["regime_detection"]["distribution"] = distribution
+    if current_regime:
+        export["stages"]["regime_detection"]["current_regime"] = current_regime
+    if regime_labels:
+        export["stages"]["regime_detection"]["regime_labels"] = regime_labels
+
+    # Stage 07 — forecasts
+    forecasts = artifacts.load_artifact(run_id, "stage07_forecasts")
+    if forecasts:
+        export["stages"]["forecasting"]["forecasts"] = forecasts
+
+    # Stage 08 — backtest
+    metrics = artifacts.load_artifact(run_id, "stage08_metrics")
+    equity = artifacts.load_artifact(run_id, "stage08_equity_curve")
+    trades = artifacts.load_artifact(run_id, "stage08_trades")
+    signal_decay = artifacts.load_artifact(run_id, "stage08_signal_decay")
+    regime_perf = artifacts.load_artifact(run_id, "stage08_regime_performance")
+    comparison = artifacts.load_artifact(run_id, "stage08_comparison")
+    if metrics:
+        export["stages"]["backtesting"]["metrics"] = metrics
+    if equity:
+        export["stages"]["backtesting"]["equity_curve"] = equity
+    if trades:
+        export["stages"]["backtesting"]["trades"] = trades
+    if signal_decay:
+        export["stages"]["backtesting"]["signal_decay"] = signal_decay
+    if regime_perf:
+        export["stages"]["backtesting"]["regime_performance"] = regime_perf
+    if comparison:
+        export["stages"]["backtesting"]["benchmark_comparison"] = comparison
+
+    # Top-level results summary
+    if metrics:
+        export["results"]["backtest_summary"] = metrics
+    if current_regime:
+        export["results"]["current_regime"] = current_regime
+    if forecasts:
+        export["results"]["forecast_assets"] = list(forecasts.keys())
+    if discovery_meta:
+        export["results"]["causal_edges"] = discovery_meta.get("n_directed")
+
+    from fastapi.responses import JSONResponse
+    from utils.serialization import NumpyEncoder
+    import json as _json
+    content = _json.dumps(export, cls=NumpyEncoder, indent=2)
+    return JSONResponse(
+        content=_json.loads(content),
+        headers={"Content-Disposition": f'attachment; filename="causal-oracle-{run_id}.json"'}
+    )
 
 
 @router.get("/health")

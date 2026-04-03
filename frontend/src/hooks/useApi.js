@@ -56,6 +56,11 @@ export function useApi() {
     return res.data
   }
 
+  const exportRun = async (runId) => {
+    const res = await api.get(`/pipeline/runs/${runId}/export`)
+    return res.data
+  }
+
   const health = async () => {
     const res = await api.get('/health')
     return res.data
@@ -63,6 +68,6 @@ export function useApi() {
 
   return {
     startRun, listRuns, getRun, deleteRun,
-    getGraph, getForecast, getBacktest, getRegimes, getValidation, getLogs, health,
+    getGraph, getForecast, getBacktest, getRegimes, getValidation, getLogs, exportRun, health,
   }
 }

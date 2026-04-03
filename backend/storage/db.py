@@ -25,10 +25,21 @@ async def init_db():
                 stage_statuses TEXT DEFAULT '{}',
                 logs TEXT DEFAULT '[]',
                 created_at TEXT NOT NULL,
+                started_at TEXT,
                 completed_at TEXT,
+                total_duration_sec REAL,
                 results_available INTEGER DEFAULT 0
             )
         """)
+        # Migrate existing DBs — add columns if missing
+        for col, definition in [
+            ("started_at", "TEXT"),
+            ("total_duration_sec", "REAL"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE pipeline_runs ADD COLUMN {col} {definition}")
+            except Exception:
+                pass  # column already exists
         await db.commit()
     logger.info(f"Database initialized at {DB_PATH}")
 
@@ -37,8 +48,9 @@ async def save_run(run_data: dict):
     async with aiosqlite.connect(str(DB_PATH)) as db:
         await db.execute("""
             INSERT OR REPLACE INTO pipeline_runs
-            (id, status, config, current_stage, stage_statuses, logs, created_at, completed_at, results_available)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, status, config, current_stage, stage_statuses, logs,
+             created_at, started_at, completed_at, total_duration_sec, results_available)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             run_data["id"],
             run_data["status"],
@@ -47,7 +59,9 @@ async def save_run(run_data: dict):
             json.dumps(run_data["stage_statuses"]),
             json.dumps(run_data["logs"]),
             run_data["created_at"],
+            run_data.get("started_at"),
             run_data.get("completed_at"),
+            run_data.get("total_duration_sec"),
             1 if run_data.get("results_available") else 0,
         ))
         await db.commit()

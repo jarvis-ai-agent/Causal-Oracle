@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
 import { usePipelineStore } from '../store/pipelineStore'
 import { useApi } from '../hooks/useApi'
-import { fmtDate } from '../utils/formatting'
+import { fmtDate, fmtDateTime, fmtDuration } from '../utils/formatting'
 
 const TICKERS_PRESETS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'SPY', 'QQQ', 'GLD', 'TLT']
 
@@ -21,7 +21,8 @@ function Badge({ status }) {
 
 export default function PipelineControl() {
   const { config, setConfig, runs, setRuns, setActiveRunId, setActiveView, clearResults, clearWsEvents, resetStageProgress } = usePipelineStore()
-  const { startRun, listRuns, deleteRun } = useApi()
+  const { startRun, listRuns, deleteRun, exportRun } = useApi()
+  const [exporting, setExporting] = useState(null)
   const [advanced, setAdvanced] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -66,6 +67,25 @@ export default function PipelineControl() {
       setRuns(updated)
     } catch (e) {
       console.error('Delete failed:', e)
+    }
+  }
+
+  const handleExport = async (e, id) => {
+    e.stopPropagation()
+    setExporting(id)
+    try {
+      const data = await exportRun(id)
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `causal-oracle-${id}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      console.error('Export failed:', err)
+    } finally {
+      setExporting(null)
     }
   }
 
@@ -263,17 +283,28 @@ export default function PipelineControl() {
                   <div className="text-xs text-terminal-muted">
                     Target: <span className="text-terminal-text">{run.target}</span>
                   </div>
-                  <div className="text-xs text-terminal-muted">
+                  <div className="text-xs text-terminal-muted truncate">
                     {run.tickers?.join(', ')}
                   </div>
+                  {run.total_duration_sec != null && (
+                    <div className="text-xs text-terminal-accent">{fmtDuration(run.total_duration_sec)}</div>
+                  )}
                   <div className="flex items-center justify-between mt-1">
-                    <span className="text-xs text-terminal-muted">{fmtDate(run.created_at)}</span>
-                    <button
-                      onClick={e => { e.stopPropagation(); handleDeleteRun(run.id) }}
-                      className="text-xs text-terminal-muted hover:text-terminal-red"
-                    >
-                      ✕
-                    </button>
+                    <span className="text-xs text-terminal-muted">{fmtDateTime(run.created_at)}</span>
+                    <div className="flex gap-1.5">
+                      {run.results_available && (
+                        <button
+                          onClick={e => handleExport(e, run.id)}
+                          disabled={exporting === run.id}
+                          className="text-xs text-terminal-accent hover:text-terminal-text"
+                          title="Export JSON"
+                        >↓</button>
+                      )}
+                      <button
+                        onClick={e => { e.stopPropagation(); handleDeleteRun(run.id) }}
+                        className="text-xs text-terminal-muted hover:text-terminal-red"
+                      >✕</button>
+                    </div>
                   </div>
                 </div>
               ))

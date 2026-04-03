@@ -27,6 +27,21 @@ export function signClass(val) {
   return 'num-neutral'
 }
 
+export function fmtDuration(sec) {
+  if (sec == null || isNaN(sec)) return '—'
+  const s = Math.round(sec)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  const rem = s % 60
+  return rem > 0 ? `${m}m ${rem}s` : `${m}m`
+}
+
+export function fmtDateTime(isoStr) {
+  if (!isoStr) return '—'
+  const d = new Date(isoStr)
+  return d.toLocaleString('en-GB', { dateStyle: 'short', timeStyle: 'short' })
+}
+
 export function regimeColor(regime) {
   if (!regime) return '#5a6a7e'
   const r = regime.toLowerCase()
